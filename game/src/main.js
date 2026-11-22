@@ -1,119 +1,162 @@
-// Vaultbreak entry point: fixed-step loop, menus, click-to-move, sounds.
-// With ?shot=<name> it stages one screenshot scene, draws one frame and
-// sets window.__shotReady so the screenshot runner knows it is done.
+// Vaultbreak — entry point. Boots the canvas, runs the fixed-step loop,
+// and wires world events to sounds and to the screen-reader status line.
+//
+// Two modes, picked by the URL:
+//   ?shot=start|play|alarm|end&seed=N — screenshot mode: stage the scene
+//     with the autopilot, paint the frozen world, raise window.__shotReady.
+//   anything else — the playable game: title, run, win / game over.
+//
+// No network, no assets, no build step: plain ES modules over static files.
 
-import { FIELD, STEP, BEST_KEY } from './config.js';
-import { createWorld, stepWorld, SCREEN_TITLE, SCREEN_PLAY, SCREEN_OVER, SCREEN_WIN, EVENT_LOOT, EVENT_VAULT, EVENT_CAUGHT, EVENT_ALARM, EVENT_WIN, EVENT_OVER, EVENT_UNLOCK } from './world.js';
-import { render } from './render.js';
-import { createInput } from './input.js';
-import { createAudio } from './audio.js';
+import { freshWorld, stepWorld, startRun, clockText, alarmLabel } from './world.js';
+import { paintScene } from './render.js';
+import { makeInput, readControl, keyHit, clickHit, endFrame, clearGoto } from './input.js';
+import {
+  makeAudio,
+  ensureAudio,
+  setMuted,
+  playTick,
+  playPickup,
+  playUnlock,
+  playCaught,
+  playWin,
+  playLose,
+  startSiren,
+  stopSiren,
+} from './audio.js';
 import { stageShot } from './shots.js';
 
-const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
-const params = new URLSearchParams(window.location.search);
-const shotName = params.get('shot');
-const audio = createAudio();
-const input = createInput(canvas);
-input.attach();
+const STEP = 1 / 60;
 
-const world = createWorld();
-world.best = Number(window.localStorage.getItem(BEST_KEY) || 0);
-world.toTitle();
-
-let clickTarget = null;
-let lastStep = 0;
-let acc = 0;
-let lastTime = 0;
-
-function playEventSound(events) {
-  if (events & EVENT_VAULT) audio.vault();
-  else if (events & EVENT_LOOT) audio.loot();
-  if (events & EVENT_ALARM) audio.alarm();
-  if (events & EVENT_CAUGHT) audio.caught();
-  if (events & EVENT_UNLOCK) audio.unlockDoor();
-  if (events & EVENT_WIN) audio.win();
+function announce(statusEl, world) {
+  if (!statusEl) return;
+  const bits = [
+    `Alarm ${alarmLabel(world)}`,
+    `Score $${world.score}`,
+    `Loot ${world.lootGot} of 4`,
+    `Time ${clockText(world)}`,
+    `Lives ${world.lives}`,
+  ];
+  if (world.phase === 'title') bits.push('Title screen. Press Enter to start.');
+  if (world.phase === 'won') bits.push('You escaped. Clean getaway.');
+  if (world.phase === 'over') bits.push(world.overReason || 'Game over.');
+  statusEl.textContent = bits.join('. ');
 }
 
-function saveBest() {
-  if (world.score > world.best) {
-    world.best = world.score;
-    try { window.localStorage.setItem(BEST_KEY, String(world.best)); } catch { /* private mode */ }
+function handleEvents(world, audio) {
+  for (const ev of world.events) {
+    if (ev.type === 'pickup') playPickup(audio);
+    else if (ev.type === 'unlock') playUnlock(audio);
+    else if (ev.type === 'alarm') startSiren(audio);
+    else if (ev.type === 'alarmClear') stopSiren(audio);
+    else if (ev.type === 'caught') {
+      playCaught(audio);
+      stopSiren(audio);
+    } else if (ev.type === 'win') {
+      stopSiren(audio);
+      playWin(audio);
+    } else if (ev.type === 'timeout') {
+      stopSiren(audio);
+      playLose(audio);
+    }
   }
 }
 
-function frame(now) {
-  requestAnimationFrame(frame);
-  if (!lastTime) lastTime = now;
-  let dt = (now - lastTime) / 1000;
-  lastTime = now;
-  if (dt > 0.25) dt = 0.25;
-  acc += dt;
-  const polled = input.poll();
-  audio.setMuted(input.muted);
-  if (input.takeRestart()) {
-    audio.unlock();
-    saveBest();
-    world.startRun();
-    clickTarget = null;
+function boot() {
+  const canvas = document.getElementById('game');
+  const statusEl = document.getElementById('status');
+  if (!canvas) {
+    window.__shotError = 'no canvas #game';
+    return;
   }
-  const click = input.takeClick();
-  if (click) {
-    audio.unlock();
-    if (world.screen === SCREEN_TITLE) {
-      world.startRun();
-    } else if (world.screen === SCREEN_OVER || world.screen === SCREEN_WIN) {
-      saveBest();
-      world.startRun();
-    } else {
-      clickTarget = click;
-    }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    window.__shotError = 'no 2d context';
+    return;
   }
-  if (input.takeConfirm()) {
-    audio.unlock();
-    if (world.screen === SCREEN_TITLE) world.startRun();
-    else if (world.screen === SCREEN_OVER || world.screen === SCREEN_WIN) {
-      saveBest();
-      world.startRun();
-    }
-  }
-  let steps = 0;
-  while (acc >= STEP && steps < 5) {
-    acc -= STEP;
-    steps += 1;
-    if (world.screen === SCREEN_PLAY) {
-      let mx = polled.mx;
-      let my = polled.my;
-      if (mx === 0 && my === 0 && clickTarget) {
-        const p = world.state.player;
-        const dx = clickTarget.x - p.x;
-        const dy = clickTarget.y - p.y;
-        const d = Math.hypot(dx, dy);
-        if (d < 8) clickTarget = null;
-        else { mx = dx / d; my = dy / d; }
-      } else if (mx !== 0 || my !== 0) {
-        clickTarget = null;
-      }
-      const events = stepWorld(world, STEP, { mx, my, sneak: polled.sneak });
-      playEventSound(events);
-      if (events & (EVENT_OVER | EVENT_WIN)) saveBest();
-      lastStep += 1;
-      if (lastStep % 40 === 0 && polled.mx === 0 && polled.my === 0 && world.state.player.moving) audio.step();
-    }
-  }
-  render(ctx, world, now / 1000, world.timeLeft);
-}
 
-if (shotName) {
-  try {
-    const staged = stageShot(shotName, world);
-    world.screen = staged.screen;
-    world.best = staged.best;
-    render(ctx, world, 1.5, world.timeLeft);
+  const params = new URLSearchParams(window.location.search);
+  const shot = params.get('shot');
+  const seed = Number(params.get('seed') || 1) || 1;
+  const world = freshWorld(seed);
+  const input = makeInput(canvas);
+  const audio = makeAudio();
+
+  // --- screenshot mode -----------------------------------------------------
+  if (shot) {
+    try {
+      stageShot(shot, world);
+    } catch (err) {
+      window.__shotError = String(err && err.message ? err.message : err);
+      return;
+    }
+    const t0 = performance.now();
+    const draw = () => {
+      paintScene(ctx, world, (performance.now() - t0) / 1000);
+      window.requestAnimationFrame(draw);
+    };
+    paintScene(ctx, world, 0);
     window.__shotReady = true;
-  } catch (err) {
-    window.__shotError = String(err && err.message ? err.message : err);
+    window.requestAnimationFrame(draw);
+    return;
   }
+
+  // --- playable mode ---------------------------------------------------------
+  let last = performance.now();
+  let acc = 0;
+  let lastAnnounce = 0;
+
+  const frame = (now) => {
+    window.requestAnimationFrame(frame);
+    const dt = Math.min(0.25, (now - last) / 1000);
+    last = now;
+
+    // Screen changes and one-shot keys.
+    if (keyHit(input, 'KeyM')) {
+      setMuted(audio, !audio.muted);
+    }
+    if (world.phase !== 'playing') {
+      if (keyHit(input, 'Enter') || keyHit(input, 'Space') || clickHit(input)) {
+        ensureAudio(audio);
+        playTick(audio);
+        startRun(world);
+        clearGoto(input);
+      }
+    } else if (keyHit(input, 'KeyR')) {
+      ensureAudio(audio);
+      startRun(world);
+      clearGoto(input);
+    }
+    if (clickHit(input) && world.phase === 'playing') ensureAudio(audio);
+
+    // Fixed-step simulation so the game plays the same at any refresh rate.
+    acc += dt;
+    let guard = 0;
+    while (acc >= STEP && guard < 5) {
+      const ctrl = readControl(input);
+      stepWorld(world, ctrl, STEP);
+      handleEvents(world, audio);
+      acc -= STEP;
+      guard += 1;
+    }
+    if (guard >= 5) acc = 0; // a long hitch must not spiral into catch-up
+
+    paintScene(ctx, world, now / 1000);
+
+    if (now - lastAnnounce > 2000) {
+      lastAnnounce = now;
+      announce(statusEl, world);
+    }
+    endFrame(input);
+  };
+
+  paintScene(ctx, world, 0);
+  announce(statusEl, world);
+  window.requestAnimationFrame(frame);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', boot);
 } else {
-  requestAnimationFrame(frame);
+  boot();
 }

@@ -1,449 +1,476 @@
-// Canvas rendering for Vaultbreak: bank floor, guard cones, camera beams,
-// glowing vault loot, getaway van, HUD with the alarm meter, and screens.
-// Everything is drawn from the world state; nothing here simulates.
+// Vaultbreak — canvas painter. All art is drawn in code: no images, no
+// fonts fetched, no assets of any kind. Draw order is deliberate —
+// floor, shadows, loot and van, then cones and beams on the floor, then
+// the people and cameras, then the HUD, then screens and the alarm banner.
+//
+// paintScene(ctx, world, visualT) — visualT is seconds for pulsing and
+// glow animation; it may keep running while the simulation is frozen
+// (screenshot mode), which is what makes a frozen frame still shimmer.
 
-import { FIELD, LEVEL, PALETTE, FONT, GUARD, CAMERA, PLAYER } from './config.js';
-import {
-  SCREEN_TITLE, SCREEN_PLAY, SCREEN_OVER, SCREEN_WIN, formatMoney, formatTime,
-} from './world.js';
+import { VIEW_W, VIEW_H, HUD_H, PALETTE, TUNE } from './config.js';
+import { clockText, alarmLabel } from './world.js';
+import { wobble } from './random.js';
 
-function roundRect(ctx, x, y, w, h, r) {
+function rr(ctx, x, y, w, h, r) {
+  // Rounded-rect path, no fill or stroke applied.
+  const rad = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
+  ctx.moveTo(x + rad, y);
+  ctx.lineTo(x + w - rad, y);
+  ctx.arcTo(x + w, y, x + w, y + rad, rad);
+  ctx.lineTo(x + w, y + h - rad);
+  ctx.arcTo(x + w, y + h, x + w - rad, y + h, rad);
+  ctx.lineTo(x + rad, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rad, rad);
+  ctx.lineTo(x, y + rad);
+  ctx.arcTo(x, y, x + rad, y, rad);
   ctx.closePath();
 }
 
-function drawFloor(ctx) {
-  ctx.fillStyle = PALETTE.floor;
-  ctx.fillRect(0, 0, FIELD.width, FIELD.height);
-  const tile = 80;
-  for (let y = 0; y < FIELD.height; y += tile) {
-    for (let x = 0; x < FIELD.width; x += tile) {
-      ctx.fillStyle = ((x / tile) + (y / tile)) % 2 === 0 ? PALETTE.floorAlt : PALETTE.floorGold;
-      ctx.fillRect(x, y, tile, tile);
+function text(ctx, s, x, y, size, color, weight, align) {
+  ctx.fillStyle = color;
+  ctx.font = `${weight || 600} ${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(s, x, y);
+}
+
+export function paintScene(ctx, world, visualT) {
+  const floor = world.floor;
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+
+  paintFloor(ctx, floor, visualT);
+  paintShadows(ctx, floor);
+  paintVan(ctx, world, visualT);
+  paintLoot(ctx, world, visualT);
+  paintCones(ctx, world);
+  paintBeams(ctx, world);
+  paintBlocks(ctx, floor);
+  paintWalls(ctx, floor);
+  paintCameras(ctx, world, visualT);
+  paintGuards(ctx, world, visualT);
+  paintThief(ctx, world, visualT);
+  paintHud(ctx, world);
+  if (world.phase === 'title') paintTitle(ctx, world, visualT);
+  else if (world.phase === 'won') paintWon(ctx, world);
+  else if (world.phase === 'over') paintOver(ctx, world);
+  if (world.alarm && world.phase === 'playing') paintAlarm(ctx, world, visualT);
+  if (world.flash > 0 && world.phase === 'playing') {
+    ctx.fillStyle = `rgba(255, 40, 30, ${Math.min(0.28, world.flash * 0.3)})`;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  }
+}
+
+// --- floor -----------------------------------------------------------------
+
+function paintFloor(ctx, floor, visualT) {
+  ctx.fillStyle = PALETTE.floorA;
+  ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
+  // Checker tiles, faint, so movement reads at a glance.
+  const tile = 64;
+  for (let y = HUD_H; y < VIEW_H; y += tile) {
+    for (let x = 0; x < VIEW_W; x += tile) {
+      if (((x / tile) | 0) % 2 === ((y / tile) | 0) % 2) {
+        ctx.fillStyle = PALETTE.floorB;
+        ctx.fillRect(x, y, tile, tile);
+      }
     }
   }
-  ctx.strokeStyle = 'rgba(255,217,77,0.05)';
+  ctx.strokeStyle = PALETTE.floorLine;
   ctx.lineWidth = 1;
-  for (let x = 0; x <= FIELD.width; x += tile) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, FIELD.height); ctx.stroke();
+  for (let x = 0; x <= VIEW_W; x += tile) {
+    ctx.beginPath();
+    ctx.moveTo(x, HUD_H);
+    ctx.lineTo(x, VIEW_H);
+    ctx.stroke();
   }
-  for (let y = 0; y <= FIELD.height; y += tile) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(FIELD.width, y); ctx.stroke();
+  for (let y = HUD_H; y <= VIEW_H; y += tile) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(VIEW_W, y);
+    ctx.stroke();
   }
-  // Vault room floor: gold-tinted marble.
-  ctx.fillStyle = 'rgba(255,217,77,0.08)';
-  ctx.fillRect(1004, 24, 252, 176);
-  ctx.fillStyle = 'rgba(255,217,77,0.55)';
-  ctx.font = `bold 15px ${FONT}`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('V A U L T', 1130, 46);
-  ctx.textAlign = 'left';
-  for (const sh of LEVEL.shadows) {
+  // Vault carpet, top-right, where the big gold sits.
+  ctx.fillStyle = PALETTE.carpet;
+  rr(ctx, 1040, 84, 220, 130, 10);
+  ctx.fill();
+  ctx.strokeStyle = PALETTE.carpetEdge;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  text(ctx, 'VAULT', 1150, 204, 13, PALETTE.textDim, 700, 'center');
+  // Entrance mat, bottom-left by the van.
+  ctx.fillStyle = PALETTE.carpet;
+  rr(ctx, 24, 596, 200, 104, 10);
+  ctx.fill();
+  ctx.strokeStyle = PALETTE.carpetEdge;
+  ctx.stroke();
+  text(ctx, 'ENTRANCE', 124, 688, 12, PALETTE.textDim, 700, 'center');
+}
+
+function paintShadows(ctx, floor) {
+  for (const s of floor.shadows) {
     ctx.fillStyle = PALETTE.shadow;
-    roundRect(ctx, sh.x, sh.y, sh.w, sh.h, 18);
+    rr(ctx, s.x, s.y, s.w, s.h, 14);
     ctx.fill();
     ctx.strokeStyle = PALETTE.shadowEdge;
     ctx.lineWidth = 2;
+    ctx.setLineDash([7, 5]);
     ctx.stroke();
-    ctx.fillStyle = 'rgba(238,241,245,0.35)';
-    ctx.font = `12px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.fillText('SHADOW — HIDDEN', sh.x + sh.w / 2, sh.y + sh.h / 2);
-    ctx.textAlign = 'left';
+    ctx.setLineDash([]);
+    text(ctx, 'SHADOW', s.x + s.w / 2, s.y + s.h / 2 + 4, 12, '#5f74ad', 700, 'center');
   }
 }
 
-function drawExit(ctx, open, t) {
-  const e = LEVEL.exit;
-  const pulse = open ? 0.6 + 0.4 * Math.sin(t * 4) : 0.25;
-  ctx.fillStyle = open ? PALETTE.exitOpen : PALETTE.exitLocked;
-  ctx.globalAlpha = 0.35 + 0.4 * pulse;
-  roundRect(ctx, e.x - 6, e.y - 6, e.w + 12, e.h + 12, 10);
-  ctx.fill();
-  ctx.globalAlpha = 1;
-  // Getaway van body.
-  ctx.fillStyle = open ? '#1d7a4a' : '#3a3a2e';
-  roundRect(ctx, e.x, e.y, e.w, e.h, 8);
-  ctx.fill();
-  ctx.strokeStyle = open ? '#7fe0a8' : '#8a8358';
-  ctx.lineWidth = 3;
-  ctx.stroke();
-  ctx.fillStyle = '#111';
-  ctx.beginPath(); ctx.arc(e.x + 24, e.y + e.h - 10, 10, 0, Math.PI * 2); ctx.fill();
-  ctx.beginPath(); ctx.arc(e.x + e.w - 24, e.y + e.h - 10, 10, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#eef1f5';
-  ctx.font = `bold 14px ${FONT}`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(open ? 'GETAWAY' : 'VAN LOCKED', e.x + e.w / 2, e.y + 26);
-  ctx.font = `12px ${FONT}`;
-  ctx.fillText(open ? 'ESCAPE HERE!' : 'TAKE ALL LOOT', e.x + e.w / 2, e.y + 48);
-  ctx.textAlign = 'left';
-}
-
-function drawLoot(ctx, loot, t) {
-  for (const l of loot) {
-    if (l.taken) continue;
-    const bob = Math.sin(t * 3 + l.x) * 3;
-    const y = l.y + bob;
-    const isVault = l.kind === 'vault';
-    const glowR = isVault ? 34 + Math.sin(t * 4) * 6 : 22;
-    ctx.fillStyle = isVault ? 'rgba(255,217,77,0.28)' : 'rgba(255,217,77,0.14)';
-    ctx.beginPath(); ctx.arc(l.x, y, glowR, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = isVault ? 'rgba(255,217,77,0.7)' : 'rgba(255,217,77,0.35)';
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(l.x, y, glowR - 4, 0, Math.PI * 2); ctx.stroke();
-    if (l.kind === 'vault' || l.kind === 'gold') {
-      // Stack of gold bars.
-      ctx.fillStyle = PALETTE.loot;
-      ctx.fillRect(l.x - 16, y - 4, 32, 12);
-      ctx.fillRect(l.x - 11, y - 14, 22, 10);
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillRect(l.x - 16, y - 4, 32, 3);
-    } else if (l.kind === 'gem') {
-      ctx.save();
-      ctx.translate(l.x, y);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillStyle = PALETTE.gem;
-      ctx.fillRect(-10, -10, 20, 20);
-      ctx.fillStyle = 'rgba(255,255,255,0.75)';
-      ctx.fillRect(-10, -10, 20, 6);
-      ctx.restore();
-    } else {
-      // Cash stack.
-      ctx.fillStyle = PALETTE.cash;
-      ctx.fillRect(l.x - 14, y - 9, 28, 18);
-      ctx.fillStyle = 'rgba(255,255,255,0.7)';
-      ctx.beginPath(); ctx.arc(l.x, y, 5, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.fillStyle = '#fff';
-    ctx.font = `bold 13px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText(formatMoney(l.value), l.x, y - glowR - 2);
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-  }
-}
-
-function drawFurnitureAndWalls(ctx) {
-  for (const c of LEVEL.furniture) {
-    ctx.fillStyle = PALETTE.desk;
-    ctx.fillRect(c.x, c.y, c.w, c.h);
-    ctx.fillStyle = PALETTE.deskTop;
-    ctx.fillRect(c.x, c.y, c.w, 9);
-    ctx.strokeStyle = 'rgba(0,0,0,0.45)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(c.x + 1, c.y + 1, c.w - 2, c.h - 2);
-  }
-  for (const w of LEVEL.walls) {
-    ctx.fillStyle = PALETTE.wall;
-    ctx.fillRect(w.x, w.y, w.w, w.h);
+function paintWalls(ctx, floor) {
+  for (const w of floor.walls) {
     ctx.fillStyle = PALETTE.wallTop;
-    if (w.h <= w.w) ctx.fillRect(w.x, w.y, w.w, 5);
-    else ctx.fillRect(w.x, w.y, 5, w.h);
+    ctx.fillRect(w.x, w.y, w.w, Math.min(4, w.h));
+    ctx.fillStyle = PALETTE.wall;
+    ctx.fillRect(w.x, w.y + Math.min(4, w.h), w.w, w.h - Math.min(4, w.h));
   }
-  // Vault door frame on the vault-room doorway.
-  ctx.fillStyle = PALETTE.vaultDoor;
-  ctx.fillRect(1080, 200, 8, 24);
-  ctx.fillRect(1152, 200, 8, 24);
 }
 
-function drawCones(ctx, guards, alarm) {
-  for (const g of guards) {
-    const alert = alarm || g.mode === 'chase';
-    ctx.fillStyle = alert ? PALETTE.coneAlert : PALETTE.cone;
+// --- furniture ---------------------------------------------------------------
+
+function paintBlocks(ctx, floor) {
+  for (const b of floor.blocks) {
+    if (b.kind === 'desk' || b.kind === 'counter') {
+      ctx.fillStyle = PALETTE.desk;
+      rr(ctx, b.x, b.y, b.w, b.h, 6);
+      ctx.fill();
+      ctx.fillStyle = PALETTE.deskTop;
+      rr(ctx, b.x + 5, b.y + 5, b.w - 10, b.h - 10, 4);
+      ctx.fill();
+      // Papers on the desk.
+      ctx.fillStyle = 'rgba(238, 241, 248, 0.75)';
+      ctx.fillRect(b.x + 12, b.y + 10, 22, 14);
+      ctx.fillRect(b.x + b.w - 40, b.y + b.h - 24, 26, 14);
+    } else if (b.kind === 'case') {
+      ctx.fillStyle = PALETTE.caseFrame;
+      rr(ctx, b.x, b.y, b.w, b.h, 6);
+      ctx.fill();
+      ctx.fillStyle = PALETTE.caseGlass;
+      rr(ctx, b.x + 6, b.y + 6, b.w - 12, b.h - 12, 4);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      ctx.fillRect(b.x + 12, b.y + 8, b.w - 24, 5);
+    } else {
+      // Planter: soil box with three leafy tufts.
+      ctx.fillStyle = PALETTE.planter;
+      rr(ctx, b.x, b.y + b.h - 26, b.w, 26, 5);
+      ctx.fill();
+      ctx.fillStyle = PALETTE.plant;
+      for (let i = 0; i < 3; i += 1) {
+        const cx = b.x + 14 + i * ((b.w - 28) / 2);
+        ctx.beginPath();
+        ctx.arc(cx, b.y + b.h - 34, 13, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    text(ctx, b.label, b.x + b.w / 2, b.y + b.h / 2 + 4, 10, 'rgba(238, 241, 248, 0.55)', 700, 'center');
+  }
+}
+
+// --- loot and van --------------------------------------------------------------
+
+function paintLoot(ctx, world, visualT) {
+  for (const item of world.loot) {
+    if (item.taken) continue;
+    const pulse = 0.5 + 0.5 * wobble(visualT, item.sparkle, 2.4);
+    const glowR = 30 + pulse * 10;
+    const grad = ctx.createRadialGradient(item.x, item.y, 4, item.x, item.y, glowR);
+    grad.addColorStop(0, item.color);
+    grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.globalAlpha = 0.35 + pulse * 0.25;
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(item.x, item.y, glowR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    if (item.id === 'gem') {
+      // Faceted diamond.
+      ctx.fillStyle = item.color;
+      ctx.beginPath();
+      ctx.moveTo(item.x, item.y - 14);
+      ctx.lineTo(item.x + 12, item.y);
+      ctx.lineTo(item.x, item.y + 14);
+      ctx.lineTo(item.x - 12, item.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+      ctx.beginPath();
+      ctx.moveTo(item.x, item.y - 14);
+      ctx.lineTo(item.x + 12, item.y);
+      ctx.lineTo(item.x, item.y);
+      ctx.closePath();
+      ctx.fill();
+    } else if (item.id === 'cash') {
+      ctx.fillStyle = item.color;
+      rr(ctx, item.x - 15, item.y - 10, 30, 20, 3);
+      ctx.fill();
+      ctx.fillStyle = '#2c6b28';
+      ctx.beginPath();
+      ctx.arc(item.x, item.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      // Gold: a little pile of bars.
+      ctx.fillStyle = PALETTE.goldDeep;
+      rr(ctx, item.x - 16, item.y + 2, 32, 10, 3);
+      ctx.fill();
+      ctx.fillStyle = item.color;
+      rr(ctx, item.x - 12, item.y - 6, 24, 10, 3);
+      ctx.fill();
+      ctx.fillStyle = '#fff3c4';
+      rr(ctx, item.x - 6, item.y - 12, 12, 8, 2);
+      ctx.fill();
+    }
+    text(ctx, `$${item.value.toLocaleString('en-US')}`, item.x, item.y + 30, 12, item.color, 700, 'center');
+    text(ctx, item.label, item.x, item.y - 24, 10, PALETTE.textDim, 700, 'center');
+  }
+}
+
+function paintVan(ctx, world, visualT) {
+  const v = world.floor.van;
+  const open = world.vanOpen;
+  const pulse = open ? 0.5 + 0.5 * wobble(visualT, 0, 3) : 0;
+  if (open) {
+    ctx.strokeStyle = `rgba(88, 214, 141, ${0.5 + pulse * 0.5})`;
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 6]);
+    rr(ctx, v.x - 6, v.y - 6, v.w + 12, v.h + 12, 12);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // Van body, nose pointing right toward the street.
+  ctx.fillStyle = open ? PALETTE.van : '#6e3a34';
+  rr(ctx, v.x, v.y + 12, v.w, v.h - 24, 10);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.vanDark;
+  rr(ctx, v.x + v.w - 34, v.y + 20, 30, v.h - 40, 6);
+  ctx.fill();
+  ctx.fillStyle = '#bfe3ff';
+  ctx.fillRect(v.x + v.w - 30, v.y + 26, 20, 16);
+  ctx.fillStyle = '#20242e';
+  ctx.beginPath();
+  ctx.arc(v.x + 26, v.y + v.h - 12, 11, 0, Math.PI * 2);
+  ctx.arc(v.x + v.w - 26, v.y + v.h - 12, 11, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#7c828f';
+  ctx.beginPath();
+  ctx.arc(v.x + 26, v.y + v.h - 12, 5, 0, Math.PI * 2);
+  ctx.arc(v.x + v.w - 26, v.y + v.h - 12, 5, 0, Math.PI * 2);
+  ctx.fill();
+  text(ctx, open ? 'GETAWAY — GO!' : 'GETAWAY (LOCKED)', v.x + v.w / 2, v.y - 10, 12, open ? '#58d68d' : PALETTE.textDim, 700, 'center');
+}
+
+// --- cones and beams -----------------------------------------------------------
+
+function paintCones(ctx, world) {
+  for (const g of world.guards) {
+    const hot = g.mode !== 'patrol';
+    ctx.fillStyle = hot ? PALETTE.coneHot : PALETTE.cone;
     ctx.beginPath();
     ctx.moveTo(g.x, g.y);
-    ctx.arc(g.x, g.y, GUARD.range, g.facing - GUARD.coneHalf, g.facing + GUARD.coneHalf);
+    ctx.arc(g.x, g.y, TUNE.coneRange, g.heading - TUNE.coneHalf, g.heading + TUNE.coneHalf);
     ctx.closePath();
     ctx.fill();
-  }
-}
-
-function drawCameraBeams(ctx, cameras, alarm) {
-  for (const cam of cameras) {
-    const alert = alarm || cam.seesPlayer;
-    ctx.fillStyle = alert ? PALETTE.beamAlert : PALETTE.beam;
-    ctx.beginPath();
-    ctx.moveTo(cam.x, cam.y);
-    ctx.arc(cam.x, cam.y, CAMERA.range, cam.facing - CAMERA.halfAngle, cam.facing + CAMERA.halfAngle);
-    ctx.closePath();
-    ctx.fill();
-    // Sight line down the beam centre.
-    ctx.strokeStyle = alert ? 'rgba(255,80,80,0.85)' : 'rgba(255,80,80,0.45)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 6]);
-    ctx.beginPath();
-    ctx.moveTo(cam.x, cam.y);
-    ctx.lineTo(cam.x + Math.cos(cam.facing) * CAMERA.range, cam.y + Math.sin(cam.facing) * CAMERA.range);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-}
-
-function drawPatrolPaths(ctx, guards) {
-  ctx.strokeStyle = 'rgba(238,241,245,0.10)';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([4, 8]);
-  for (const g of guards) {
-    ctx.beginPath();
-    const wps = g.waypoints;
-    ctx.moveTo(wps[0][0], wps[0][1]);
-    for (let i = 1; i < wps.length; i += 1) ctx.lineTo(wps[i][0], wps[i][1]);
-    ctx.closePath();
-    ctx.stroke();
-  }
-  ctx.setLineDash([]);
-}
-
-function drawCamera(ctx, cam, t) {
-  ctx.fillStyle = '#222';
-  ctx.beginPath(); ctx.arc(cam.x, cam.y, 11, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = cam.seesPlayer ? '#ff5050' : '#8b93a3';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-  const fx = Math.cos(cam.facing);
-  const fy = Math.sin(cam.facing);
-  ctx.fillStyle = cam.seesPlayer ? '#ff5050' : '#eef1f5';
-  ctx.beginPath(); ctx.arc(cam.x + fx * 8, cam.y + fy * 8, 4, 0, Math.PI * 2); ctx.fill();
-  if (cam.seesPlayer) {
-    ctx.fillStyle = '#ff5050';
-    ctx.font = `bold 13px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText('CAM!', cam.x, cam.y - 16);
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-  }
-}
-
-function drawGuard(ctx, g, alarm, t) {
-  const alert = alarm || g.mode === 'chase';
-  ctx.fillStyle = alert ? PALETTE.guard : PALETTE.guardCalm;
-  ctx.beginPath();
-  ctx.arc(g.x, g.y, GUARD.radius, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = '#1a0d0d';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-  const fx = Math.cos(g.facing);
-  const fy = Math.sin(g.facing);
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(g.x + fx * GUARD.radius, g.y + fy * GUARD.radius);
-  ctx.lineTo(g.x + fx * (GUARD.radius + 10), g.y + fy * (GUARD.radius + 10));
-  ctx.stroke();
-  ctx.fillStyle = '#fff';
-  ctx.beginPath();
-  ctx.arc(g.x + fx * 5 - fy * 5, g.y + fy * 5 + fx * 5, 2.5, 0, Math.PI * 2);
-  ctx.arc(g.x + fx * 5 + fy * 5, g.y + fy * 5 - fx * 5, 2.5, 0, Math.PI * 2);
-  ctx.fill();
-  // Cap brim.
-  ctx.strokeStyle = '#1a0d0d';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.arc(g.x, g.y, GUARD.radius - 3, Math.PI * 0.15, Math.PI * 0.85);
-  ctx.stroke();
-  if (alert) {
-    ctx.fillStyle = '#fff';
-    ctx.font = `bold 22px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText('!', g.x, g.y - GUARD.radius - 6);
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-  }
-  if (g.mode === 'search') {
-    ctx.fillStyle = '#ffd166';
-    ctx.font = `bold 18px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText('?', g.x, g.y - GUARD.radius - 6);
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-  }
-}
-
-function drawPlayer(ctx, p, t) {
-  ctx.fillStyle = p.sneak ? PALETTE.playerSneak : PALETTE.player;
-  ctx.beginPath();
-  ctx.arc(p.x, p.y, PLAYER.radius, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = '#2a1e05';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-  const fx = Math.cos(p.facing);
-  const fy = Math.sin(p.facing);
-  // Hood point in the facing direction.
-  ctx.fillStyle = '#2a1e05';
-  ctx.beginPath();
-  ctx.moveTo(p.x + fx * (PLAYER.radius + 8), p.y + fy * (PLAYER.radius + 8));
-  ctx.lineTo(p.x - fy * 7 + fx * 4, p.y + fx * 7 + fy * 4);
-  ctx.lineTo(p.x + fy * 7 + fx * 4, p.y - fx * 7 + fy * 4);
-  ctx.closePath();
-  ctx.fill();
-  ctx.fillStyle = '#fff';
-  ctx.beginPath();
-  ctx.arc(p.x + fx * 4 - fy * 4, p.y + fy * 4 + fx * 4, 2.2, 0, Math.PI * 2);
-  ctx.arc(p.x + fx * 4 + fy * 4, p.y + fy * 4 - fx * 4, 2.2, 0, Math.PI * 2);
-  ctx.fill();
-  if (p.sneak) {
-    ctx.strokeStyle = 'rgba(238,241,245,0.5)';
+    ctx.strokeStyle = hot ? 'rgba(255, 72, 60, 0.5)' : 'rgba(255, 214, 90, 0.35)';
     ctx.lineWidth = 1.5;
-    ctx.setLineDash([3, 5]);
+    ctx.stroke();
+  }
+}
+
+function paintBeams(ctx, world) {
+  for (const c of world.cameras) {
+    const ex = c.x + Math.cos(c.heading) * c.range;
+    const ey = c.y + Math.sin(c.heading) * c.range;
+    // Wide faint wedge so the sweep reads, plus a hard centre line.
+    ctx.fillStyle = 'rgba(255, 60, 50, 0.10)';
     ctx.beginPath();
-    ctx.arc(p.x, p.y, PLAYER.radius + 6, 0, Math.PI * 2);
+    ctx.moveTo(c.x, c.y);
+    ctx.arc(c.x, c.y, c.range, c.heading - c.half * 2.2, c.heading + c.half * 2.2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = PALETTE.beam;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([10, 7]);
+    ctx.beginPath();
+    ctx.moveTo(c.x, c.y);
+    ctx.lineTo(ex, ey);
     ctx.stroke();
     ctx.setLineDash([]);
-  }
-  ctx.fillStyle = '#fff';
-  ctx.font = `bold 12px ${FONT}`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'bottom';
-  ctx.fillText('THIEF', p.x, p.y - PLAYER.radius - 5);
-  ctx.textBaseline = 'middle';
-  ctx.textAlign = 'left';
-}
-
-function drawHud(ctx, world, timeLeft) {
-  const s = world.state;
-  const alarm = s.alarm;
-  ctx.fillStyle = alarm ? 'rgba(120,20,20,0.92)' : 'rgba(13,15,20,0.88)';
-  ctx.fillRect(0, 0, FIELD.width, 48);
-  ctx.fillStyle = PALETTE.text;
-  ctx.font = `bold 17px ${FONT}`;
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('VAULTBREAK', 16, 25);
-  ctx.fillStyle = PALETTE.loot;
-  ctx.fillText(`◆ ${s.lootTaken}/${s.loot.length} loot`, 180, 25);
-  ctx.fillStyle = PALETTE.text;
-  ctx.fillText(`Score ${formatMoney(world.score)}`, 330, 25);
-  ctx.fillStyle = timeLeft < 30 ? PALETTE.danger : PALETTE.text;
-  ctx.fillText(`⏱ ${formatTime(timeLeft)}`, 520, 25);
-  ctx.fillStyle = PALETTE.text;
-  ctx.fillText('♥'.repeat(Math.max(0, s.lives)) + '♡'.repeat(Math.max(0, PLAYER.lives - s.lives)), 640, 25);
-  // Alarm meter, labelled, right side.
-  const mw = 230;
-  const mx = FIELD.width - mw - 16;
-  ctx.fillStyle = '#eef1f5';
-  ctx.font = `bold 13px ${FONT}`;
-  ctx.textAlign = 'right';
-  ctx.fillText('ALARM', mx - 8, 25);
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#333';
-  roundRect(ctx, mx, 14, mw, 20, 10);
-  ctx.fill();
-  const d = s.detection;
-  ctx.fillStyle = alarm ? PALETTE.danger : d > 0.66 ? PALETTE.danger : d > 0.33 ? '#f2c94c' : '#7fb069';
-  if (d > 0.02 || alarm) {
-    roundRect(ctx, mx, 14, Math.max(20, mw * Math.max(d, alarm ? 1 : 0)), 20, 10);
+    ctx.fillStyle = '#ff5a4d';
+    ctx.beginPath();
+    ctx.arc(ex, ey, 4, 0, Math.PI * 2);
     ctx.fill();
   }
-  ctx.fillStyle = '#fff';
-  ctx.font = `bold 13px ${FONT}`;
-  ctx.textAlign = 'center';
-  ctx.fillText(alarm ? 'ALARM!' : d > 0.02 ? 'SPOTTED' : 'HIDDEN', mx + mw / 2, 24);
-  ctx.textAlign = 'left';
-  // Bottom hint.
-  ctx.fillStyle = PALETTE.muted;
-  ctx.font = `14px ${FONT}`;
-  ctx.textAlign = 'center';
-  ctx.fillText(
-    s.exitOpen
-      ? 'Van is open — reach the getaway van, bottom left!'
-      : 'WASD / arrows to move · hold Shift to sneak · hide in shadows · dodge cones and camera beams',
-    FIELD.width / 2, FIELD.height - 12,
-  );
-  ctx.textAlign = 'left';
 }
 
-function overlay(ctx, title, lines, accent) {
-  ctx.fillStyle = 'rgba(10,12,17,0.78)';
-  ctx.fillRect(0, 0, FIELD.width, FIELD.height);
-  ctx.fillStyle = accent || PALETTE.text;
-  ctx.font = `bold 52px ${FONT}`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(title, FIELD.width / 2, 235);
-  ctx.fillStyle = PALETTE.text;
-  ctx.font = `20px ${FONT}`;
-  lines.forEach((line, i) => {
-    ctx.fillText(line, FIELD.width / 2, 305 + i * 34);
-  });
-  ctx.textAlign = 'left';
+// --- people and cameras ----------------------------------------------------------
+
+function paintCameras(ctx, world, visualT) {
+  for (const c of world.cameras) {
+    const blink = 0.5 + 0.5 * wobble(visualT, c.id * 2.1, 4);
+    ctx.fillStyle = '#2b3247';
+    rr(ctx, c.x - 11, c.y - 8, 22, 16, 4);
+    ctx.fill();
+    ctx.strokeStyle = '#4d5c85';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = `rgba(255, 70, 60, ${0.5 + blink * 0.5})`;
+    ctx.beginPath();
+    ctx.arc(c.x + Math.cos(c.heading) * 12, c.y + Math.sin(c.heading) * 12, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
 
-export function render(ctx, world, t, timeLeft) {
-  const s = world.state;
-  const tl = timeLeft !== undefined ? timeLeft : world.timeLeft;
-  ctx.clearRect(0, 0, FIELD.width, FIELD.height);
-  ctx.fillStyle = PALETTE.backdrop;
-  ctx.fillRect(0, 0, FIELD.width, FIELD.height);
-  drawFloor(ctx);
-  drawPatrolPaths(ctx, s.guards);
-  drawCones(ctx, s.guards, s.alarm);
-  drawCameraBeams(ctx, s.cameras, s.alarm);
-  drawExit(ctx, s.exitOpen, t);
-  drawLoot(ctx, s.loot, t);
-  drawFurnitureAndWalls(ctx);
-  for (const cam of s.cameras) drawCamera(ctx, cam, t);
-  for (const g of s.guards) drawGuard(ctx, g, s.alarm, t);
-  drawPlayer(ctx, s.player, t);
-  if (world.screen === SCREEN_PLAY) drawHud(ctx, world, tl);
-  if (s.alarm) {
-    const flash = 0.10 + 0.08 * Math.sin(s.alarmFlash * 10);
-    ctx.fillStyle = `rgba(229,83,75,${Math.max(0.04, flash)})`;
-    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
-    ctx.fillStyle = '#ff5050';
-    ctx.font = `bold 30px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.fillText('⚠ ALARM — RUN! ⚠', FIELD.width / 2, 84);
-    ctx.textAlign = 'left';
+function paintGuards(ctx, world, visualT) {
+  for (const g of world.guards) {
+    const bob = g.mode === 'patrol' ? Math.sin(visualT * 6 + g.id * 2) * 1.5 : 0;
+    // Body: dark uniform with a gold cap and a torch dot.
+    ctx.fillStyle = PALETTE.guardDark;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y + bob * 0.3, TUNE.guardRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.guard;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y + bob * 0.3, TUNE.guardRadius - 4, 0, Math.PI * 2);
+    ctx.fill();
+    // Facing tick.
+    ctx.strokeStyle = '#fff2c4';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(g.x, g.y);
+    ctx.lineTo(g.x + Math.cos(g.heading) * 18, g.y + Math.sin(g.heading) * 18);
+    ctx.stroke();
+    if (g.mode !== 'patrol') {
+      text(ctx, '!', g.x, g.y - 22, 18, '#ff5347', 800, 'center');
+    }
   }
-  if (s.caughtFlash > 0) {
-    ctx.fillStyle = `rgba(229,83,75,${Math.min(0.35, s.caughtFlash)})`;
-    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
+}
+
+function paintThief(ctx, world, visualT) {
+  const t = world.thief;
+  const hidden = world.phase === 'playing' && world.meter <= 0.04;
+  const bob = t.moving ? Math.sin(visualT * 10) * 1.5 : 0;
+  if (t.invuln > 0 && Math.floor(visualT * 8) % 2 === 0) {
+    // Blink while invulnerable after a catch.
+    return;
   }
-  if (world.screen === SCREEN_TITLE) {
-    overlay(ctx, 'VAULTBREAK', [
-      'The Midnight Lift — one bank, one vault, three guards, three cameras.',
-      'Lift the $5,000 vault gold and every stash, then reach the getaway van.',
-      'You have 3:00 and 3 lives. Cameras sweep — their red beams fill the alarm too.',
-      '',
-      'Move: WASD / arrows · Sneak (slow, spotted half as fast): hold Shift',
-      'Click a spot to walk there · R restart · M mute · Enter to start',
-      '',
-      'Press Enter or click to begin the heist',
-    ], PALETTE.player);
-  } else if (world.screen === SCREEN_OVER) {
-    overlay(ctx, world.overReason === 'time' ? 'TIME UP!' : 'CAUGHT!', [
-      world.overReason === 'time'
-        ? 'The clock hit 0:00 — the vault locked down and the crew scattered.'
-        : 'The guards closed in three times. The lift is blown.',
-      `Loot kept: ${formatMoney(s.lootValue)} · Final score ${formatMoney(world.score)}.`,
-      'Press Enter or R to run the heist again',
-    ], PALETTE.danger);
-  } else if (world.screen === SCREEN_WIN) {
-    overlay(ctx, 'CLEAN GETAWAY!', [
-      `All loot lifted — ${formatMoney(s.lootValue)} — and out in the van.`,
-      `Final score ${formatMoney(world.score)} (time bonus included).`,
-      `Best on this machine: ${formatMoney(Math.max(world.best, world.score))}.`,
-      'Press Enter or R to pull another job',
-    ], PALETTE.player);
+  // Soft ring so the thief reads against dark floor.
+  ctx.strokeStyle = t.sneaking ? 'rgba(124, 231, 255, 0.8)' : 'rgba(238, 241, 248, 0.5)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(t.x, t.y + bob * 0.3, t.r + 4, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = PALETTE.thiefCoat;
+  ctx.beginPath();
+  ctx.arc(t.x, t.y + bob * 0.3, t.r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.thief;
+  ctx.beginPath();
+  ctx.arc(t.x, t.y + bob * 0.3, t.r - 5, 0, Math.PI * 2);
+  ctx.fill();
+  // Little mask stripe, facing the heading.
+  ctx.strokeStyle = '#20242e';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(t.x + Math.cos(t.heading) * 4, t.y + Math.sin(t.heading) * 4);
+  ctx.lineTo(t.x + Math.cos(t.heading) * (t.r + 1), t.y + Math.sin(t.heading) * (t.r + 1));
+  ctx.stroke();
+  if (t.sneaking) text(ctx, 'SNEAK', t.x, t.y - 22, 10, '#7ce7ff', 700, 'center');
+  if (hidden) text(ctx, 'HIDDEN', t.x, t.y - 22, 10, '#58d68d', 700, 'center');
+}
+
+// --- HUD ---------------------------------------------------------------------
+
+function paintHud(ctx, world) {
+  ctx.fillStyle = PALETTE.hud;
+  ctx.fillRect(0, 0, VIEW_W, HUD_H);
+  ctx.fillStyle = PALETTE.hudLine;
+  ctx.fillRect(0, HUD_H - 2, VIEW_W, 2);
+
+  text(ctx, 'VAULTBREAK', 16, 30, 20, PALETTE.text, 800);
+  text(ctx, 'THE MIDNIGHT LIFT', 16, 50, 11, PALETTE.textDim, 600);
+
+  // Alarm meter, labelled, with its state word.
+  const label = alarmLabel(world);
+  text(ctx, 'ALARM', 250, 24, 12, PALETTE.textDim, 700);
+  const bx = 250;
+  const by = 30;
+  const bw = 260;
+  const bh = 16;
+  ctx.fillStyle = PALETTE.alarmBarBg;
+  rr(ctx, bx, by, bw, bh, 8);
+  ctx.fill();
+  const frac = world.meter;
+  if (frac > 0.01) {
+    ctx.fillStyle = world.alarm ? PALETTE.alarmBar : frac > 0.6 ? '#ffb347' : PALETTE.okBar;
+    rr(ctx, bx, by, Math.max(12, bw * frac), bh, 8);
+    ctx.fill();
   }
-  const status = document.getElementById('status');
-  if (status) {
-    status.textContent = world.screen === SCREEN_PLAY
-      ? `${s.lootTaken} of ${s.loot.length} loot, ${formatMoney(world.score)}, ${formatTime(tl)} left, ${s.lives} lives, ${s.alarm ? 'alarm!' : 'hidden'}.`
-      : world.screen;
-  }
+  ctx.strokeStyle = PALETTE.hudLine;
+  ctx.lineWidth = 1.5;
+  rr(ctx, bx, by, bw, bh, 8);
+  ctx.stroke();
+  text(ctx, label, bx + bw + 12, by + 13, 14, world.alarm ? '#ff5347' : label === 'SPOTTED' ? '#ffb347' : '#58d68d', 800);
+
+  // Score, loot pips, timer, lives.
+  text(ctx, `$${world.score.toLocaleString('en-US')}`, 640, 32, 22, PALETTE.gold, 800);
+  text(ctx, `LOOT ${world.lootGot}/4`, 640, 52, 11, PALETTE.textDim, 600);
+  text(ctx, clockText(world), 830, 32, 22, world.timeLeft < 30 ? '#ff5347' : PALETTE.text, 800);
+  text(ctx, 'TIME', 830, 52, 11, PALETTE.textDim, 600);
+  let hearts = '';
+  for (let i = 0; i < world.lives; i += 1) hearts += '♥ ';
+  text(ctx, hearts || '—', 960, 32, 20, '#ff6b81', 700);
+  text(ctx, 'LIVES', 960, 52, 11, PALETTE.textDim, 600);
+  text(ctx, `BEST $${world.best.toLocaleString('en-US')}`, 1120, 32, 13, PALETTE.textDim, 600);
+  text(ctx, 'R restart · M mute', 1120, 52, 11, PALETTE.textDim, 600);
+}
+
+function paintAlarm(ctx, world, visualT) {
+  const pulse = 0.5 + 0.5 * Math.sin(visualT * 6);
+  ctx.fillStyle = `rgba(255, 30, 20, ${0.10 + pulse * 0.10})`;
+  ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
+  // Banner across the middle of the HUD strip.
+  ctx.fillStyle = '#c22a20';
+  ctx.fillRect(0, HUD_H, VIEW_W, 30);
+  text(ctx, 'ALARM — RUN!', VIEW_W / 2, HUD_H + 21, 17, '#ffffff', 800, 'center');
+}
+
+// --- screens -------------------------------------------------------------------
+
+function dim(ctx) {
+  ctx.fillStyle = 'rgba(8, 10, 18, 0.78)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+}
+
+function paintTitle(ctx, world, visualT) {
+  dim(ctx);
+  const lift = Math.sin(visualT * 1.4) * 4;
+  text(ctx, 'VAULTBREAK', VIEW_W / 2, 210 + lift, 64, PALETTE.gold, 800, 'center');
+  text(ctx, 'THE MIDNIGHT LIFT', VIEW_W / 2, 250 + lift, 24, PALETTE.text, 600, 'center');
+  text(ctx, 'Lift $7,500 from the vault. Dodge the cones, beat the beams,', VIEW_W / 2, 310, 17, PALETTE.textDim, 600, 'center');
+  text(ctx, 'then reach the getaway van before the 3:00 clock runs out.', VIEW_W / 2, 336, 17, PALETTE.textDim, 600, 'center');
+  text(ctx, 'WASD / arrows to move · click to walk · SHIFT to sneak', VIEW_W / 2, 392, 16, PALETTE.text, 600, 'center');
+  text(ctx, 'Shadows hide you · desks and cases block sight · R restarts · M mutes', VIEW_W / 2, 420, 16, PALETTE.text, 600, 'center');
+  const blink = 0.5 + 0.5 * Math.sin(visualT * 3);
+  text(ctx, 'ENTER or CLICK to start', VIEW_W / 2, 480, 20, `rgba(238, 241, 248, ${0.55 + blink * 0.45})`, 700, 'center');
+  text(ctx, '3 lives · 3 guards · 3 cameras · 4 stashes', VIEW_W / 2, 530, 14, PALETTE.textDim, 600, 'center');
+}
+
+function paintWon(ctx, world) {
+  dim(ctx);
+  text(ctx, 'CLEAN GETAWAY!', VIEW_W / 2, 260, 56, '#58d68d', 800, 'center');
+  text(ctx, `You lifted $${world.score.toLocaleString('en-US')} and vanished into the night.`, VIEW_W / 2, 320, 19, PALETTE.text, 600, 'center');
+  text(ctx, `Best: $${world.best.toLocaleString('en-US')}`, VIEW_W / 2, 356, 16, PALETTE.textDim, 600, 'center');
+  text(ctx, 'ENTER or CLICK to run it again', VIEW_W / 2, 430, 18, PALETTE.text, 700, 'center');
+}
+
+function paintOver(ctx, world) {
+  dim(ctx);
+  text(ctx, 'BUSTED', VIEW_W / 2, 260, 56, '#ff5347', 800, 'center');
+  text(ctx, world.overReason || 'The run is over.', VIEW_W / 2, 320, 19, PALETTE.text, 600, 'center');
+  text(ctx, `Score: $${world.score.toLocaleString('en-US')} · Best: $${world.best.toLocaleString('en-US')}`, VIEW_W / 2, 356, 16, PALETTE.textDim, 600, 'center');
+  text(ctx, 'ENTER or CLICK to try again', VIEW_W / 2, 430, 18, PALETTE.text, 700, 'center');
 }
